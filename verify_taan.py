@@ -65,14 +65,14 @@ from taan_advantage import (
 )
 
 # ---------------------------------------------------------------------------
-# Simulation parameters
+# Simulation parameters  — GSM8K profile
 # ---------------------------------------------------------------------------
 
 SEEN_TYPES_GSM8K = ["arithmetic", "equation", "ratio"]
 UNSEEN_TYPES_GSM8K = ["geometry", "probability"]
 
 # Approximate distribution: 80 % seen, 20 % unseen
-TYPE_DISTRIBUTION = {
+_GSM8K_DISTRIBUTION = {
     "arithmetic": 0.32,
     "equation": 0.26,
     "ratio": 0.22,
@@ -81,7 +81,7 @@ TYPE_DISTRIBUTION = {
 }
 
 # Reward / advantage variance per type (seen types have much higher variance)
-TYPE_STD = {
+_GSM8K_STD = {
     "arithmetic": 3.4,
     "equation": 3.2,
     "ratio": 3.1,
@@ -89,7 +89,82 @@ TYPE_STD = {
     "probability": 0.28,
 }
 
+# Keep legacy names for backward compatibility.
+TYPE_DISTRIBUTION = _GSM8K_DISTRIBUTION
+TYPE_STD = _GSM8K_STD
 TYPE_MEAN = {k: 0.0 for k in TYPE_STD}  # zero-mean advantages
+
+# ---------------------------------------------------------------------------
+# Simulation parameters  — MATH profile
+# ---------------------------------------------------------------------------
+
+SEEN_TYPES_MATH = ["algebra", "number_theory"]
+UNSEEN_TYPES_MATH = ["counting_and_prob", "geometry", "precalculus"]
+
+# Approximate MATH distribution (algebra ~30 %, number_theory ~14 %,
+# prealgebra ~22 % mapped to arithmetic, rest split across unseen types).
+_MATH_DISTRIBUTION = {
+    "algebra": 0.30,
+    "number_theory": 0.14,
+    "arithmetic": 0.22,        # prealgebra problems classified as arithmetic
+    "counting_and_prob": 0.12,
+    "geometry": 0.12,
+    "precalculus": 0.10,
+}
+
+# MATH seen types exhibit higher reward variance than unseen types.
+_MATH_STD = {
+    "algebra": 2.5,
+    "number_theory": 2.0,
+    "arithmetic": 1.8,
+    "counting_and_prob": 0.40,
+    "geometry": 0.35,
+    "precalculus": 0.30,
+}
+
+# ---------------------------------------------------------------------------
+# Profile registry
+# ---------------------------------------------------------------------------
+
+_PROFILES: dict[str, dict] = {
+    "gsm8k": {
+        "distribution": _GSM8K_DISTRIBUTION,
+        "std": _GSM8K_STD,
+        "seen_types": SEEN_TYPES_GSM8K,
+        "unseen_types": UNSEEN_TYPES_GSM8K,
+        "label": "GSM8K",
+    },
+    "math": {
+        "distribution": _MATH_DISTRIBUTION,
+        "std": _MATH_STD,
+        "seen_types": SEEN_TYPES_MATH,
+        "unseen_types": UNSEEN_TYPES_MATH,
+        "label": "MATH",
+    },
+}
+
+# Combined profile for --dataset both
+_BOTH_DISTRIBUTION = {
+    k: v * 0.5 for k, v in _GSM8K_DISTRIBUTION.items()
+}
+for k, v in _MATH_DISTRIBUTION.items():
+    _BOTH_DISTRIBUTION[k] = _BOTH_DISTRIBUTION.get(k, 0.0) + v * 0.5
+
+_BOTH_STD = {**_GSM8K_STD, **_MATH_STD}
+# 'arithmetic' appears in both profiles; use the higher variance so the
+# combined batch reflects the wider GSM8K spread (avoids under-estimating
+# the compression ratio for unseen types).
+_BOTH_STD["arithmetic"] = max(_GSM8K_STD["arithmetic"], _MATH_STD["arithmetic"])
+
+_PROFILES["both"] = {
+    "distribution": _BOTH_DISTRIBUTION,
+    "std": _BOTH_STD,
+    "seen_types": list(dict.fromkeys(SEEN_TYPES_GSM8K + SEEN_TYPES_MATH)),
+    "unseen_types": list(
+        dict.fromkeys(UNSEEN_TYPES_GSM8K + UNSEEN_TYPES_MATH)
+    ),
+    "label": "GSM8K + MATH",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -100,20 +175,34 @@ TYPE_MEAN = {k: 0.0 for k in TYPE_STD}  # zero-mean advantages
 def generate_batch(
     n_samples: int = 150,
     seed: int = 42,
+    dataset: str = "gsm8k",
 ) -> tuple[torch.Tensor, list[str]]:
     """Generate a synthetic advantage batch.
+
+    Parameters
+    ----------
+    n_samples:
+        Number of samples to generate.
+    seed:
+        RNG seed for reproducibility.
+    dataset:
+        Simulation profile to use: ``"gsm8k"``, ``"math"``, or ``"both"``.
 
     Returns
     -------
     advantages : torch.Tensor shape (n_samples,)
     problem_types : list[str]  length n_samples
     """
+    profile = _PROFILES[dataset]
+    distribution: dict[str, float] = profile["distribution"]
+    std_map: dict[str, float] = profile["std"]
+
     rng = random.Random(seed)
     torch.manual_seed(seed)
 
     types: list[str] = []
-    type_names = list(TYPE_DISTRIBUTION.keys())
-    weights = [TYPE_DISTRIBUTION[t] for t in type_names]
+    type_names = list(distribution.keys())
+    weights = [distribution[t] for t in type_names]
 
     for _ in range(n_samples):
         t = rng.choices(type_names, weights=weights, k=1)[0]
@@ -121,9 +210,8 @@ def generate_batch(
 
     advantages_list: list[float] = []
     for t in types:
-        mu = TYPE_MEAN[t]
-        sigma = TYPE_STD[t]
-        val = torch.empty(1).normal_(mu, sigma).item()
+        sigma = std_map[t]
+        val = torch.empty(1).normal_(0.0, sigma).item()
         advantages_list.append(val)
 
     return torch.tensor(advantages_list), types
@@ -164,16 +252,20 @@ def gradient_scale(
 # ---------------------------------------------------------------------------
 
 
-def run_verification(n_samples: int = 150, seed: int = 42, batch_repeat: int = 1) -> None:
+def run_verification(n_samples: int = 150, seed: int = 42, batch_repeat: int = 1, dataset: str = "gsm8k") -> None:
+    profile = _PROFILES[dataset]
+    seen_types: list[str] = profile["seen_types"]
+    unseen_types: list[str] = profile["unseen_types"]
+
     print("=" * 60)
-    print("  TAAN Signal Quality Verification")
+    print(f"  TAAN Signal Quality Verification  [{profile['label']}]")
     print("=" * 60)
 
     all_advantages: list[float] = []
     all_types: list[str] = []
 
     for k in range(batch_repeat):
-        adv, types = generate_batch(n_samples=n_samples, seed=seed + k)
+        adv, types = generate_batch(n_samples=n_samples, seed=seed + k, dataset=dataset)
         all_advantages.extend(adv.tolist())
         all_types.extend(types)
 
@@ -185,7 +277,7 @@ def run_verification(n_samples: int = 150, seed: int = 42, batch_repeat: int = 1
     # Compression ratio
     # ------------------------------------------------------------------
     cr = compression_ratio(
-        advantages, all_types, SEEN_TYPES_GSM8K, UNSEEN_TYPES_GSM8K
+        advantages, all_types, seen_types, unseen_types
     )
     print(f"=== Normalization comparison ===")
     print(f"  Compression ratio (σ_seen/σ_unseen)²  ≈ {cr:.1f}×")
@@ -195,13 +287,13 @@ def run_verification(n_samples: int = 150, seed: int = 42, batch_repeat: int = 1
     # Global normalization
     # ------------------------------------------------------------------
     global_norm = grpo_global_normalize(advantages)
-    scale_global = gradient_scale(global_norm, all_types, UNSEEN_TYPES_GSM8K)
+    scale_global = gradient_scale(global_norm, all_types, unseen_types)
 
     # ------------------------------------------------------------------
     # TAAN normalization
     # ------------------------------------------------------------------
     taan_norm = compute_taan_advantages(advantages, all_types)
-    scale_taan = gradient_scale(taan_norm, all_types, UNSEEN_TYPES_GSM8K)
+    scale_taan = gradient_scale(taan_norm, all_types, unseen_types)
 
     print(f"  Global norm  — unseen-type gradient scale : {scale_global:.3f}")
     print(f"  TAAN norm    — unseen-type gradient scale : {scale_taan:.3f}  (target ≈ 1.0)")
@@ -312,6 +404,18 @@ def _parse_args() -> argparse.Namespace:
                    help="Samples per synthetic batch")
     p.add_argument("--batch-repeat", type=int, default=1,
                    help="Number of batches to concatenate for statistics")
+    p.add_argument(
+        "--dataset",
+        choices=["gsm8k", "math", "both"],
+        default="gsm8k",
+        help=(
+            "Dataset profile to simulate: "
+            "'gsm8k' (arithmetic/equation/ratio seen, geometry/probability unseen), "
+            "'math' (algebra/number_theory seen, counting_and_prob/geometry/precalculus unseen), "
+            "or 'both' (mixed batch from both profiles). "
+            "Default: gsm8k"
+        ),
+    )
     return p.parse_args()
 
 
@@ -321,4 +425,5 @@ if __name__ == "__main__":
         n_samples=args.n_samples,
         seed=args.seed,
         batch_repeat=args.batch_repeat,
+        dataset=args.dataset,
     )
