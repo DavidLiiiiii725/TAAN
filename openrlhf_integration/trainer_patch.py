@@ -127,11 +127,37 @@ def taan_normalize_advantages(
 # Monkey-patch helper
 # ---------------------------------------------------------------------------
 
+# Candidate module paths for GRPOTrainer, tried in order.
+_GRPO_MODULE_CANDIDATES = [
+    ("openrlhf.trainer.grpo_trainer", "GRPOTrainer"),
+    ("openrlhf.trainer.ppo_trainer", "GRPOTrainer"),
+    ("openrlhf.trainer.ray.grpo_trainer", "GRPOTrainer"),
+    ("openrlhf.trainer.ray.ppo_actor", "GRPOTrainer"),
+]
+
+
+def _import_grpo_trainer():
+    """Return (module, class_name, OrigClass) for the first importable
+    GRPOTrainer candidate.  Returns ``(None, None, None)`` if not found."""
+    for mod_path, cls_name in _GRPO_MODULE_CANDIDATES:
+        try:
+            import importlib
+            mod = importlib.import_module(mod_path)
+            cls = getattr(mod, cls_name, None)
+            if cls is not None:
+                return mod, cls_name, cls
+        except ImportError:
+            continue
+    return None, None, None
+
 
 def patch_grpo_trainer(use_taan: bool = True, taan_eps: float = 1e-8) -> None:
     """Monkey-patch OpenRLHF's GRPOTrainer to use TAAN normalization.
 
     Call this once **before** the trainer is instantiated.
+
+    Automatically discovers the GRPOTrainer class across multiple possible
+    module paths to support different OpenRLHF versions.
 
     Parameters
     ----------
@@ -141,17 +167,14 @@ def patch_grpo_trainer(use_taan: bool = True, taan_eps: float = 1e-8) -> None:
     taan_eps:
         Epsilon for numerical stability in TAAN normalization.
     """
-    try:
-        import openrlhf.trainer.grpo_trainer as grpo_mod
-    except ImportError:
+    grpo_mod, cls_name, OrigTrainer = _import_grpo_trainer()
+    if OrigTrainer is None:
         print(
-            "[TAAN] WARNING: openrlhf.trainer.grpo_trainer not found. "
-            "Trainer patch not applied.",
+            "[TAAN] WARNING: GRPOTrainer not found in any of the expected "
+            "OpenRLHF module paths. Trainer patch not applied.",
             file=sys.stderr,
         )
         return
-
-    OrigTrainer = grpo_mod.GRPOTrainer
 
     class TAANGRPOTrainer(OrigTrainer):  # type: ignore
         """GRPOTrainer subclass with TAAN advantage normalization."""
@@ -179,7 +202,8 @@ def patch_grpo_trainer(use_taan: bool = True, taan_eps: float = 1e-8) -> None:
             adv = advantages.float()
             return (adv - adv.mean()) / (adv.std(unbiased=True) + eps)
 
-    grpo_mod.GRPOTrainer = TAANGRPOTrainer
+    setattr(grpo_mod, cls_name, TAANGRPOTrainer)
     print(
-        f"[TAAN] GRPOTrainer patched (use_taan={use_taan}, taan_eps={taan_eps})."
+        f"[TAAN] {cls_name} patched in {grpo_mod.__name__} "
+        f"(use_taan={use_taan}, taan_eps={taan_eps})."
     )
