@@ -27,8 +27,9 @@ logs/
 *.err
 *.bak
 
-# Data
-data/
+# Data  (raw JSONL files are too large to commit; track scripts only)
+data/*.jsonl
+data/*.json
 
 # IDE
 .vscode/
